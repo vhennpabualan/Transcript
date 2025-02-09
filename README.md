@@ -1,5 +1,4 @@
-# Transcript
+Transcript
+This project is for testing purposes only. It transcribes audio locally on your PC.
 
-This is only for test purposes, it uses your pc locally to transcriptt audio.
-
-I'm not responsible for any damages you might incounter.
+⚠️ Disclaimer: I am not responsible for any issues or damages that may occur while using this software. Use at your own risk.

@@ -13,6 +13,8 @@ import os
 gui_queue = queue.Queue()
 
 # Create Tkinter root window
+# Create Tkinter root window
+# Create Tkinter root window
 root = tk.Tk()
 root.title("Whisper Transcriber")
 root.geometry("620x700")

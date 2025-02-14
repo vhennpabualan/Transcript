@@ -8,12 +8,16 @@ from dotenv import load_dotenv
 from pyannote.audio import Pipeline
 from pydub import AudioSegment
 from tkinter import font
-import threading
+# import threading
 import queue
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor
 import logging
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def get_whisper_model(model_name, device="cpu"):
+    return whisper.load_model(model_name, device=device)
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -21,30 +25,18 @@ class ModernWhisperApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Whisper Transcriber")
-        self.root.geometry("500x750")
-        
-        # Initialize dark mode and color schemes first
-        # Initialize dark mode and color schemes first
+        self.root.geometry("500x750") 
         # Initialize dark mode and color schemes first
         self.is_dark_mode = tk.BooleanVar(value=False)
+        self.current_task = None  # Add this line to track current transcription task
         
         # Define color schemes
         self.light_colors = {
-            'bg': '#f0f2f5',
-            'primary': '#2962ff',
-            'secondary': '#f5f5f5',
-            'text': '#1a1a1a',
-            'success': '#43a047',
-            'input_bg': 'white'
+            'bg': '#f0f2f5','primary': '#2962ff','secondary': '#f5f5f5','text': '#1a1a1a','success': '#43a047','input_bg': 'white'
         }
         
         self.dark_colors = {
-            'bg': '#1e1e1e',
-            'primary': '#0d47a1',
-            'secondary': '#2d2d2d',
-            'text': '#ffffff',
-            'success': '#2e7d32',
-            'input_bg': '#3d3d3d'
+            'bg': '#1e1e1e', 'primary': '#0d47a1','secondary': '#2d2d2d','text': '#ffffff','success': '#2e7d32','input_bg': '#3d3d3d'
         }
         
         # Set initial colors
@@ -183,7 +175,7 @@ class ModernWhisperApp:
             controls_frame,
             self.model_var,
             "medium",
-            "tiny", "base", "small", "medium", "large"
+            "tiny", "base", "small", "medium", "large", "turbo"
         )
         model_menu.grid(row=0, column=1, padx=10)
 
@@ -194,7 +186,7 @@ class ModernWhisperApp:
             style='Modern.TLabel'
         ).grid(row=0, column=2, padx=10)
 
-        languages = ["en", "es", "fr", "de", "it", "pt", "ru", "zh", "ja", "ko", "tl"]
+        languages = ["en", "tl"]
         language_menu = ttk.OptionMenu(
             controls_frame,
             self.language_var,
@@ -204,13 +196,13 @@ class ModernWhisperApp:
         language_menu.grid(row=0, column=3, padx=10)
 
         # GPU checkbox
-        gpu_check = ttk.Checkbutton(
-            controls_frame,
-            text="Use GPU",
-            variable=self.gpu_var,
-            style='Modern.TCheckbutton'
-        )
-        gpu_check.grid(row=0, column=4, padx=10)
+        # gpu_check = ttk.Checkbutton(
+        #     controls_frame,
+        #     text="Use GPU",
+        #     variable=self.gpu_var,
+        #     style='Modern.TCheckbutton'
+        # )
+        # gpu_check.grid(row=0, column=4, padx=10)
 
         # Action buttons
         button_frame = ttk.Frame(main_frame, style='Modern.TFrame')
@@ -308,22 +300,37 @@ class ModernWhisperApp:
             else:
                 self.converted_audio_file = self.audio_file
     def start_transcribing(self):
+        """Start the transcription process with proper cleanup."""
         if self.audio_file:
-            self.toggle_loading_animation(start=True)  # Start animation
-            self.executor.submit(self.convert_and_transcribe, self.converted_audio_file)
+            # Cancel any existing transcription
+            if self.current_task and not self.current_task.done():
+                self.current_task.cancel()
+            
+            self.toggle_loading_animation(start=True)
+            # Start new transcription
+            self.current_task = self.executor.submit(
+                self.convert_and_transcribe, 
+                self.converted_audio_file
+            )
         else:
             messagebox.showwarning("Warning", "Please select an audio file first.")
+            
     def toggle_loading_animation(self, start=True):
         """
-        Start or stop the progress bar animation with real progress updates.
+        Start or stop the progress bar animation with real-time progress updates.
         """
         if start:
-            self.progress_bar["mode"] = "determinate"  # Fill gradually
-            self.progress_bar["value"] = 0  # Reset progress to 0%
+            self.progress_bar["mode"] = "determinate"
+            self.progress_bar["value"] = 0
+            self.progress_label.config(text="Starting transcription...")
         else:
-            self.progress_bar["value"] = 100  # Ensure it reaches 100%
+            self.progress_bar["value"] = 100
+            self.progress_label.config(text="Complete")
    
     def update_progress(self, current: int, total: int) -> None:
+        """
+        Update the progress bar and label with current progress.
+        """
         if not isinstance(current, int) or not isinstance(total, int):
             raise TypeError("Current and total must be integers")
         if total <= 0:
@@ -333,6 +340,12 @@ class ModernWhisperApp:
         
         percentage = int((current / total) * 100)
         
+        # Update both progress bar and label via GUI queue
+        self.gui_queue.put(lambda: self.progress_bar.configure(value=percentage))
+        self.gui_queue.put(lambda: self.progress_label.config(
+            text=f"Processing: {percentage}% ({current}/{total} segments)"
+        ))
+        
     def convert_and_transcribe(self, audio_file):
         """
         Convert the audio file to WAV format and transcribe it with real-time progress updates.
@@ -340,51 +353,110 @@ class ModernWhisperApp:
         try:
             selected_model = self.model_var.get()
             device = "cpu"
-            if self.gpu_var.get():
-                try:
-                    available_devices = torch_directml.device_count()
-                    if available_devices > 0:
-                        device = torch_directml.device(0)
-                        logging.info(f"Trying DirectML GPU: {device}")
-                except Exception as e:
-                    logging.error(f"Error detecting GPU: {e}")
-                    device = "cpu"
-            logging.info(f"Loading Whisper model '{selected_model}' on {device}...")
-            model = whisper.load_model(selected_model, device="cpu")
-            if device != "cpu":
-                try:
-                    model.to(device)
-                except Exception as gpu_error:
-                    logging.error(f"DirectML error, falling back to CPU: {gpu_error}")
-                    device = "cpu"
+            
+            # Use cached model loading
+            model = get_whisper_model(selected_model, device)
             selected_language = self.language_var.get()
+            
+            # if self.gpu_var.get():
+            #     try:
+            #         available_devices = torch_directml.device_count()
+            #         if available_devices > 0:
+            #             device = torch_directml.device(0)
+            #             logging.info(f"Trying DirectML GPU: {device}")
+            #     except Exception as e:
+            #         logging.error(f"Error detecting GPU: {e}")
+            #         device = "cpu"
+            # if device != "cpu":
+            #     try:
+            #         model.to(device)
+            #     except Exception as gpu_error:
+            #         logging.error(f"DirectML error, falling back to CPU: {gpu_error}")
+            #         device = "cpu"
+    
+            # Load token once at start
             load_dotenv(dotenv_path="token.env")
             hf_token = os.getenv("HF_TOKEN")
             if not hf_token:
-                raise ValueError("Hugging Face token not found. Please set the HF_TOKEN environment variable.")
-            diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization", use_auth_token=hf_token)
+                raise ValueError("Hugging Face token not found")
+            
+            # Create diarization pipeline with optimized settings
+            diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization",
+                use_auth_token=hf_token,
+                cache_dir="./.cache"  # Cache models locally
+            )
+            # Batch process transcription
+            result = model.transcribe(
+                audio_file,
+                language=selected_language,
+                fp16=False,  # Use FP32 for better CPU performance
+            )
+
             # Start transcription
-            result = model.transcribe(audio_file, language=selected_language)
             if "segments" not in result:
-                raise ValueError("Transcription result does not contain 'segments'")
+                 raise ValueError("No segments in transcription")
+
+            # Process diarization in batches
             diarization = diarization_pipeline(audio_file)
-            combined_result = self.combine_diarization_and_transcription(diarization, result)
-            total_segments = len(combined_result["segments"])  # Get total for progress tracking
-            for i, segment in enumerate(combined_result["segments"], start=1):
-                # Send transcription to GUI queue
-                self.gui_queue.put(lambda segment=segment, i=i: self.display_transcription(segment, i, total_segments))
-                # **Update progress dynamically**
-                progress_percentage = int((i / total_segments) * 100)
-                self.gui_queue.put(lambda progress_percentage=progress_percentage: self.update_progress(progress_percentage, 100))
-                # **Force GUI updates in real-time**
-                self.root.update_idletasks()
+            
+            # Pre-process diarization results
+            diarization_map = {}
+            for turn, _, speaker_label in diarization.itertracks(yield_label=True):
+                diarization_map[(turn.start, turn.end)] = speaker_label
+
+            # Combine results more efficiently
+            combined_segments = self._batch_combine_results(result["segments"], diarization_map)
+            total_segments = len(combined_segments["segments"])
+            
+             # Clear existing text before starting new transcription
+            self.gui_queue.put(lambda: self.transcription_text.delete(1.0, tk.END))
+            
+            # Process segments with controlled GUI updates
+            for i, segment in enumerate(combined_segments["segments"], 1):
+                if i % 5 == 0 or i == 1 or i == total_segments:  # Reduce GUI updates
+                    self.gui_queue.put(
+                        lambda s=segment, c=i: self.display_transcription(s, c, total_segments)
+                    )
+                    self.update_progress(i, total_segments)
+
         except Exception as e:
-            logging.error(f"An error occurred: {e}")
+            logging.error(f"Transcription error: {e}")
             self.gui_queue.put(lambda e=e: messagebox.showerror("Error", str(e)))
+            self.gui_queue.put(lambda: self.progress_label.config(text="Error occurred"))
         finally:
-            # Ensure the progress bar reaches 100% at the end
             self.gui_queue.put(lambda: self.toggle_loading_animation(start=False))
-            self.gui_queue.put(lambda: self.update_progress(100, 100))
+            
+    def _batch_combine_results(self, segments, diarization_map):
+        """
+        Efficiently combine transcription and diarization results
+        """
+        combined = []
+        current = None
+        
+        for segment in segments:
+            start, end = segment["start"], segment["end"]
+            text = segment["text"].strip()
+            speaker = "Unknown"
+            
+            # Efficient speaker lookup
+            for (turn_start, turn_end), speaker_label in diarization_map.items():
+                if turn_start <= start and turn_end >= end:
+                    speaker = speaker_label
+                    break
+                    
+            if current and current["speaker"] == speaker:
+                current["end"] = end
+                current["text"] += " " + text
+            else:
+                if current:
+                    combined.append(current)
+                current = {"start": start, "end": end, "text": text, "speaker": speaker}
+                
+        if current:
+            combined.append(current)
+            
+        return {"segments": combined}
     def display_transcription(self, segment, current, total):
         """
         Display the transcription segment in the text area with improved formatting.
@@ -470,19 +542,126 @@ class ModernWhisperApp:
         """
         Refresh the transcription text area and reset the GUI.
         """
+        if self.current_task and not self.current_task.done():
+            self.current_task.cancel()
+            
+        # Clear the GUI queue
+        while not self.gui_queue.empty():
+            try:
+                self.gui_queue.get_nowait()
+            except queue.Empty:
+                break
+                
+        # Reset GUI elements
         self.transcription_text.delete(1.0, tk.END)
         self.selected_file_label.config(text="No file selected")
         self.green_check_label.config(text="")
         self.progress_label.config(text="")
+        self.progress_bar["value"] = 0
+        
+        # Clear file references
         self.audio_file = None
         self.converted_audio_file = None
+        
+        # Clear any temporary WAV files
+        self._cleanup_temp_files()
+    
+    def _cleanup_temp_files(self):
+        """Clean up any temporary WAV files."""
+        if self.converted_audio_file and self.converted_audio_file != self.audio_file:
+            try:
+                if os.path.exists(self.converted_audio_file):
+                    os.remove(self.converted_audio_file)
+                    logging.info(f"Cleaned up temporary file: {self.converted_audio_file}")
+            except Exception as e:
+                logging.error(f"Error cleaning up temporary file: {e}")
+
+    def select_audio_file(self):
+        """
+        Open a file dialog to select an audio file with proper cleanup.
+        """
+        # Cancel any existing transcription first
+        if self.current_task and not self.current_task.done():
+            self.current_task.cancel()
+            self.executor.shutdown(wait=True)
+            self.executor = ThreadPoolExecutor(max_workers=2)  # Create new executor
+            
+        # Reset all states
+        self._reset_state()
+        
+        # Now proceed with file selection
+        self.audio_file = filedialog.askopenfilename(
+            title="Select Audio File",
+            filetypes=[("Audio Files", "*.mp3 *.wav *.flac *.ogg *.aac *.m4a")]
+        )
+        
+        if self.audio_file:
+            file_name = os.path.basename(self.audio_file)
+            self.selected_file_label.config(text=f"Selected File: {file_name}")
+            
+            supported_formats = (".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a")
+            if not self.audio_file.lower().endswith(supported_formats):
+                messagebox.showerror("Error", "Unsupported audio file format")
+                self._reset_state()
+                return
+                
+            if not self.audio_file.lower().endswith(".wav"):
+                try:
+                    self.converted_audio_file = os.path.splitext(self.audio_file)[0] + "_temp.wav"
+                    audio = AudioSegment.from_file(self.audio_file)
+                    audio.export(self.converted_audio_file, format="wav")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to convert audio: {str(e)}")
+                    self._reset_state()
+                    return
+            else:
+                self.converted_audio_file = self.audio_file
+    def _reset_state(self):
+        """Reset all application state"""
+        # Clean up files
+        self._cleanup_temp_files()
+        
+        # Reset variables
+        self.audio_file = None
+        self.converted_audio_file = None
+        
+        # Clear GUI elements
+        self.transcription_text.delete(1.0, tk.END)
+        self.selected_file_label.config(text="No file selected")
+        self.green_check_label.config(text="")
+        self.progress_label.config(text="")
+        self.progress_bar["value"] = 0
+        
+        # Clear queue
+        while not self.gui_queue.empty():
+            try:
+                self.gui_queue.get_nowait()
+            except queue.Empty:
+                break
+    
+    def cleanup(self):
+        """Clear cached models and temporary files"""
+        import shutil
+        try:
+            shutil.rmtree("./.cache", ignore_errors=True)
+            get_whisper_model.cache_clear()
+        except Exception as e:
+            logging.warning(f"Cleanup error: {e}")
+        
     def on_closing(self):
-        """
-        Handle the application closing event.
-        """
         if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            # Cancel any running transcription
+            if self.current_task and not self.current_task.done():
+                self.current_task.cancel()
+            
+            # Clean up temporary files
+            self._cleanup_temp_files()
+            
+            # Clear cache and shutdown executor
+            self.cleanup()
             self.executor.shutdown(wait=False)
             self.root.destroy()
+            
     def process_gui_queue(self):
         """
         Process tasks in the GUI queue.

@@ -1,1 +1,34 @@
+# Cache directories
+.cache/
+__pycache__/
+*.pyc
+
+# Environment files
 token.env
+.env
+venv/
+env/
+
+# Temporary files
+*_temp.wav
+*.wav
+temp/
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Log files
+*.log
+
+# Build directories
+build/
+dist/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Project specific
+whisper_models/
+*.pt

@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from tkinter.ttk import Progressbar, Label, Button, OptionMenu, Checkbutton, Frame, Style
 from pydub import AudioSegment
+from pydub.silence import detect_silence
 import queue
 import os
 import threading

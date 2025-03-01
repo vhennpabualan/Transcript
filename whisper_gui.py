@@ -58,7 +58,7 @@ class ModernWhisperApp:
         
         # Initialize other variables
         self.gui_queue = queue.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=1)  # Reduced to 1 worker for CPU optimization
+        self.executor = ThreadPoolExecutor(max_workers=1)  # Reduced to 1 worker for CPU optimizationd
         self.audio_file = None
         self.converted_audio_file = None
         self.model_var = tk.StringVar(value="base")  # Changed default to base for faster processing

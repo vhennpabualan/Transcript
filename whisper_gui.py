@@ -1,23 +1,36 @@
 import whisper
-import torch
-import torch_directml
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from tkinter.ttk import Progressbar, Label, Button, OptionMenu, Checkbutton, Frame, Style
-from dotenv import load_dotenv
-from pyannote.audio import Pipeline
 from pydub import AudioSegment
-from tkinter import font
-# import threading
 import queue
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import logging
 from functools import lru_cache
+import time
+import torch
+from multiprocessing import cpu_count
 
 @lru_cache(maxsize=1)
 def get_whisper_model(model_name, device="cpu"):
-    return whisper.load_model(model_name, device=device)
+    """Optimized model loading with faster processing settings"""
+    try:
+        # Enable faster CPU operations
+        torch.set_num_threads(cpu_count())
+        torch.set_num_interop_threads(cpu_count())
+        torch.backends.mkldnn.enabled = True
+        
+        # Use faster compute type
+        torch.set_default_dtype(torch.float32)
+        torch.set_float32_matmul_precision('high')
+        
+        model = whisper.load_model(model_name, device=device)
+        return model
+    except Exception as e:
+        logging.error(f"Error loading model: {e}")
+        raise
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -28,7 +41,7 @@ class ModernWhisperApp:
         self.root.geometry("500x750") 
         # Initialize dark mode and color schemes first
         self.is_dark_mode = tk.BooleanVar(value=False)
-        self.current_task = None  # Add this line to track current transcription task
+        self.current_task = None  # Track current transcription task
         
         # Define color schemes
         self.light_colors = {
@@ -44,12 +57,32 @@ class ModernWhisperApp:
         
         # Initialize other variables
         self.gui_queue = queue.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=1)  # Reduced to 1 worker for CPU optimization
         self.audio_file = None
         self.converted_audio_file = None
-        self.model_var = tk.StringVar(value="medium")
+        self.model_var = tk.StringVar(value="base")  # Changed default to base for faster processing
         self.language_var = tk.StringVar(value="en")
-        self.gpu_var = tk.BooleanVar()
+        self.batch_size_var = tk.IntVar(value=3)  # New variable for batch updates
+        self.transcription_running = False
+        self.cancel_requested = False
+
+        # Performance settings
+        self.chunk_size = 30  # seconds
+        self.max_workers = min(cpu_count(), 4)  # Limit max workers
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+
+        # Control CPU usage
+        self.max_cpu_percent = 80  # Target max CPU percentage
+        self.cpu_threads = max(1, cpu_count() - 1)  # Leave one core free
+        torch.set_num_threads(self.cpu_threads)
+
+        # Add to __init__ method
+        self.processing_settings = {
+            'chunk_size': 25,  # Reduced chunk size
+            'batch_size': 8,   # Increased batch size
+            'cooling_delay': 0.05,  # Reduced cooling delay
+            'frame_buffer': 4096,  # Optimized buffer size
+        }
 
         # Now setup styles and create widgets
         self.setup_styles()
@@ -65,35 +98,23 @@ class ModernWhisperApp:
         self.style.theme_use('clam')
         
         # Configure styles with current theme colors
-        self.style.configure(
-            'Modern.TFrame',
-            background=self.colors['bg']
-        )
-        
-        # Configure normal button state
-        self.style.configure(
-            'Modern.TButton',
+        self.style.configure('Modern.TFrame', background=self.colors['bg'])
+        self.style.configure('Modern.TButton',
             background=self.colors['primary'],
             foreground='white',
             padding=10,
             font=('Segoe UI', 10)
         )
-        
-        # Configure button hover state
         self.style.map('Modern.TButton',
-            foreground=[('active', 'black')],
-            background=[('active', self.colors['secondary'])]
+            foreground=[('active', 'white')],
+            background=[('active', self.colors['primary'])]
         )
-
-        self.style.configure(
-            'Modern.Horizontal.TProgressbar',
+        self.style.configure('Modern.Horizontal.TProgressbar',
             troughcolor=self.colors['secondary'],
             background=self.colors['primary'],
             thickness=10
         )
-
-        self.style.configure(
-            'Modern.TLabel',
+        self.style.configure('Modern.TLabel',
             background=self.colors['bg'],
             foreground=self.colors['text'],
             font=('Segoe UI', 10)
@@ -120,16 +141,13 @@ class ModernWhisperApp:
             background=self.colors['bg'],
             foreground=self.colors['text']
         )
-        self.style.configure('Modern.TCheckbutton',
-            background=self.colors['bg'],
-            foreground=self.colors['text']
-        )
         
         # Update text area
         self.transcription_text.configure(
             bg=self.colors['input_bg'],
             fg=self.colors['text']
         )
+        
     def create_widgets(self):
         # Main container
         main_frame = ttk.Frame(self.root, style='Modern.TFrame', padding=20)
@@ -142,15 +160,7 @@ class ModernWhisperApp:
             style='Modern.TLabel',
             font=('Segoe UI', 24, 'bold')
         )
-        # darkmode
-        ttk.Button(
-        main_frame,
-        text="Toggle Dark Mode",
-        command=self.toggle_dark_mode,
-        style='Modern.TButton'
-        ).grid(row=10, column=0, columnspan=2, pady=(10,0), sticky="ew")
-        
-        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 30))
+        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 20))
 
         # File selection section
         self.selected_file_label = ttk.Label(
@@ -158,69 +168,74 @@ class ModernWhisperApp:
             text="No file selected",
             style='Modern.TLabel'
         )
-        self.selected_file_label.grid(row=1, column=0, columnspan=2, pady=(0, 20))
+        self.selected_file_label.grid(row=1, column=0, columnspan=2, pady=(0, 10))
 
         # Controls section
         controls_frame = ttk.Frame(main_frame, style='Modern.TFrame')
-        controls_frame.grid(row=2, column=0, columnspan=2, pady=(0, 20))
+        controls_frame.grid(row=2, column=0, columnspan=2, pady=(0, 10))
 
         # Model selection
-        ttk.Label(
-            controls_frame,
-            text="Model:",
-            style='Modern.TLabel'
-        ).grid(row=0, column=0, padx=(0, 10))
-
+        ttk.Label(controls_frame, text="Model:", style='Modern.TLabel').grid(row=0, column=0, padx=(0, 5))
+        
+        # Simplified model options
         model_menu = ttk.OptionMenu(
             controls_frame,
             self.model_var,
-            "medium",
-            "tiny", "base", "small", "medium", "large", "turbo"
+            "base",
+            "tiny", "base", "small", "medium", "turbo"  # Removed larger models for CPU efficiency
         )
-        model_menu.grid(row=0, column=1, padx=10)
+        model_menu.grid(row=0, column=1, padx=5)
 
         # Language selection
-        ttk.Label(
-            controls_frame,
-            text="Language:",
-            style='Modern.TLabel'
-        ).grid(row=0, column=2, padx=10)
-
-        languages = ["en", "tl"]
+        ttk.Label(controls_frame, text="Language:", style='Modern.TLabel').grid(row=0, column=2, padx=5)
+        
+        languages = ["en", "tl", "fr", "de", "es", "it", "ja", "zh", "ar", "ru"]
         language_menu = ttk.OptionMenu(
             controls_frame,
             self.language_var,
             "en",
             *languages
         )
-        language_menu.grid(row=0, column=3, padx=10)
-
-        # GPU checkbox
-        # gpu_check = ttk.Checkbutton(
-        #     controls_frame,
-        #     text="Use GPU",
-        #     variable=self.gpu_var,
-        #     style='Modern.TCheckbutton'
-        # )
-        # gpu_check.grid(row=0, column=4, padx=10)
+        language_menu.grid(row=0, column=3, padx=5)
+        
+        # Batch size selection
+        ttk.Label(controls_frame, text="Batch size:", style='Modern.TLabel').grid(row=0, column=4, padx=5)
+        batch_menu = ttk.OptionMenu(
+            controls_frame,
+            self.batch_size_var,
+            3,
+            1, 2, 3, 5, 10  # Batch size options
+        )
+        batch_menu.grid(row=0, column=5, padx=5)
 
         # Action buttons
         button_frame = ttk.Frame(main_frame, style='Modern.TFrame')
-        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=10)
 
-        ttk.Button(
+        self.select_button = ttk.Button(
             button_frame,
             text="Select Audio File",
             command=self.select_audio_file,
             style='Modern.TButton'
-        ).grid(row=0, column=0, padx=10)
+        )
+        self.select_button.grid(row=0, column=0, padx=5)
 
-        ttk.Button(
+        self.transcribe_button = ttk.Button(
             button_frame,
             text="Start Transcribing",
             command=self.start_transcribing,
             style='Modern.TButton'
-        ).grid(row=0, column=1, padx=10)
+        )
+        self.transcribe_button.grid(row=0, column=1, padx=5)
+        
+        self.cancel_button = ttk.Button(
+            button_frame,
+            text="Cancel",
+            command=self.cancel_transcription,
+            style='Modern.TButton',
+            state='disabled'
+        )
+        self.cancel_button.grid(row=0, column=2, padx=5)
 
         # Progress section
         self.progress_bar = ttk.Progressbar(
@@ -229,7 +244,7 @@ class ModernWhisperApp:
             mode='determinate',
             length=400
         )
-        self.progress_bar.grid(row=4, column=0, columnspan=2, pady=20, sticky="ew")
+        self.progress_bar.grid(row=4, column=0, columnspan=2, pady=10, sticky="ew")
 
         self.progress_label = ttk.Label(
             main_frame,
@@ -238,19 +253,19 @@ class ModernWhisperApp:
         )
         self.progress_label.grid(row=5, column=0, columnspan=2)
 
-        self.green_check_label = ttk.Label(
+        self.status_label = ttk.Label(
             main_frame,
             text="",
             style='Modern.TLabel'
         )
-        self.green_check_label.grid(row=6, column=0, columnspan=2)
+        self.status_label.grid(row=6, column=0, columnspan=2)
 
         # Transcription text area
         self.transcription_text = tk.Text(
             main_frame,
             wrap=tk.WORD,
             width=80,
-            height=10,
+            height=15,  # Increased height
             font=('Segoe UI', 11),
             bg='white',
             relief="flat"
@@ -263,309 +278,315 @@ class ModernWhisperApp:
             text="Save Transcription",
             command=self.save_transcription,
             style='Modern.TButton'
-        ).grid(row=8, column=0, columnspan=2, pady=(0, 10), sticky="ew")
+        ).grid(row=8, column=0, columnspan=1, pady=(10, 5), sticky="ew")
 
         ttk.Button(
             main_frame,
             text="Clear",
             command=self.refresh_transcription,
             style='Modern.TButton'
-        ).grid(row=9, column=0, columnspan=2, sticky="ew")
+        ).grid(row=8, column=1, columnspan=1, pady=(10, 5), sticky="ew")
+        
+        # Dark mode toggle button
+        ttk.Button(
+            main_frame,
+            text="Toggle Dark Mode",
+            command=self.toggle_dark_mode,
+            style='Modern.TButton'
+        ).grid(row=9, column=0, columnspan=2, pady=5, sticky="ew")
+
+        self.create_performance_settings(main_frame)
 
         # Configure grid weights
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(7, weight=1)  # Make transcription box expandable
         main_frame.grid_columnconfigure(0, weight=1)
         main_frame.grid_columnconfigure(1, weight=1)
 
+    def create_performance_settings(self, main_frame):
+        """Add performance settings to UI"""
+        perf_frame = ttk.LabelFrame(main_frame, text="Performance Settings", style='Modern.TFrame')
+        perf_frame.grid(row=10, column=0, columnspan=2, pady=5, sticky="ew")
+        
+        # CPU Thread control
+        ttk.Label(perf_frame, text="CPU Threads:", style='Modern.TLabel').grid(row=0, column=0, padx=5)
+        thread_var = tk.StringVar(value=str(self.cpu_threads))
+        thread_menu = ttk.OptionMenu(
+            perf_frame,
+            thread_var,
+            str(self.cpu_threads),
+            *[str(i) for i in range(1, cpu_count() + 1)],
+            command=lambda x: self._update_cpu_threads(int(x))
+        )
+        thread_menu.grid(row=0, column=1, padx=5)
+
+    def _update_cpu_threads(self, num_threads):
+        """Update the number of CPU threads used for processing."""
+        try:
+            # Ensure valid thread count
+            num_threads = max(1, min(num_threads, cpu_count()))
+            self.cpu_threads = num_threads
+            
+            # Update torch thread settings
+            torch.set_num_threads(num_threads)
+            
+            # Update executor
+            self.executor.shutdown(wait=False)
+            self.executor = ThreadPoolExecutor(max_workers=num_threads)
+            
+            logging.info(f"Updated CPU threads to: {num_threads}")
+            
+            # Update status label
+            self.status_label.config(text=f"CPU threads set to: {num_threads}")
+        except Exception as e:
+            logging.error(f"Error updating CPU threads: {e}")
+            messagebox.showerror("Error", f"Failed to update CPU threads: {e}")
+
     def select_audio_file(self):
-        """
-        Open a file dialog to select an audio file.
-        """
-        self.audio_file = filedialog.askopenfilename(title="Select Audio File", filetypes=[("Audio Files", "*.mp3 *.wav *.flac *.ogg *.aac *.m4a")])
+        """Open a file dialog to select an audio file."""
+        self.audio_file = filedialog.askopenfilename(
+            title="Select Audio File", 
+            filetypes=[("Audio Files", "*.mp3 *.wav *.flac *.ogg *.aac *.m4a")]
+        )
         if self.audio_file:
             file_name = os.path.basename(self.audio_file)
             self.selected_file_label.config(text=f"Selected File: {file_name}")
-            self.green_check_label.config(text="")
+            self.status_label.config(text="")
+            
+            # Check if format is supported
             supported_formats = (".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a")
             if not self.audio_file.lower().endswith(supported_formats):
                 messagebox.showerror("Error", "Unsupported audio file format. Please select a supported file.")
                 self.audio_file = None
                 self.selected_file_label.config(text="No file selected")
                 return
+            
+            # Only convert if needed - saves processing time
             if not self.audio_file.lower().endswith(".wav"):
-                self.converted_audio_file = os.path.splitext(self.audio_file)[0] + ".wav"
-                audio = AudioSegment.from_file(self.audio_file)
-                audio.export(self.converted_audio_file, format="wav")
+                # Show conversion status
+                self.progress_label.config(text="Converting audio to WAV format...")
+                self.root.update_idletasks()
+                
+                # Convert in a separate thread to prevent GUI freezing
+                threading.Thread(
+                    target=self._convert_audio_to_wav,
+                    daemon=True
+                ).start()
             else:
                 self.converted_audio_file = self.audio_file
+                self.progress_label.config(text="Ready to transcribe")
+                
+    def _convert_audio_to_wav(self):
+        """Convert audio to WAV in a separate thread."""
+        try:
+            self.converted_audio_file = os.path.splitext(self.audio_file)[0] + "_temp.wav"
+            audio = AudioSegment.from_file(self.audio_file)
+            audio.export(self.converted_audio_file, format="wav")
+            self.gui_queue.put(lambda: self.progress_label.config(text="Audio conversion complete. Ready to transcribe."))
+        except Exception as e:
+            logging.error(f"Error converting audio: {e}")
+            self.gui_queue.put(lambda e=e: messagebox.showerror("Error", f"Error converting audio: {e}"))
+            self.gui_queue.put(lambda: self.progress_label.config(text="Error converting audio"))
+                
     def start_transcribing(self):
-        """Start the transcription process with proper cleanup."""
-        if self.audio_file:
-            # Cancel any existing transcription
-            if self.current_task and not self.current_task.done():
-                self.current_task.cancel()
+        """Start the transcription process with proper UI updates."""
+        if not self.audio_file or not os.path.exists(self.audio_file):
+            messagebox.showwarning("Warning", "Please select a valid audio file first.")
+            return
             
-            self.toggle_loading_animation(start=True)
-            # Start new transcription
-            self.current_task = self.executor.submit(
-                self.convert_and_transcribe, 
-                self.converted_audio_file
-            )
-        else:
-            messagebox.showwarning("Warning", "Please select an audio file first.")
+        if not self.converted_audio_file or not os.path.exists(self.converted_audio_file):
+            messagebox.showwarning("Warning", "Audio conversion not complete. Please wait.")
+            return
             
-    def toggle_loading_animation(self, start=True):
-        """
-        Start or stop the progress bar animation with real-time progress updates.
-        """
-        if start:
-            self.progress_bar["mode"] = "determinate"
-            self.progress_bar["value"] = 0
-            self.progress_label.config(text="Starting transcription...")
-        else:
-            self.progress_bar["value"] = 100
-            self.progress_label.config(text="Complete")
-   
-    def update_progress(self, current: int, total: int) -> None:
-        """
-        Update the progress bar and label with current progress.
-        """
-        if not isinstance(current, int) or not isinstance(total, int):
-            raise TypeError("Current and total must be integers")
-        if total <= 0:
-            raise ValueError("Total must be positive")
-        if current < 0 or current > total:
-            raise ValueError("Current must be between 0 and total")
+        # Update UI state
+        self.transcription_running = True
+        self.cancel_requested = False
+        self.transcribe_button.config(state='disabled')
+        self.select_button.config(state='disabled')
+        self.cancel_button.config(state='normal')
         
-        percentage = int((current / total) * 100)
+        # Clear existing text before starting new transcription
+        self.transcription_text.delete(1.0, tk.END)
         
-        # Update both progress bar and label via GUI queue
-        self.gui_queue.put(lambda: self.progress_bar.configure(value=percentage))
-        self.gui_queue.put(lambda: self.progress_label.config(
-            text=f"Processing: {percentage}% ({current}/{total} segments)"
-        ))
+        # Reset progress indicators
+        self.progress_bar["value"] = 0
+        self.progress_label.config(text="Starting transcription...")
+        self.status_label.config(text="")
         
-    def convert_and_transcribe(self, audio_file):
-        """
-        Convert the audio file to WAV format and transcribe it with real-time progress updates.
-        """
+        # Start transcription in background
+        self.current_task = self.executor.submit(
+            self.transcribe_audio, 
+            self.converted_audio_file
+        )
+    
+    def cancel_transcription(self):
+        """Cancel the ongoing transcription."""
+        if self.transcription_running:
+            self.cancel_requested = True
+            self.status_label.config(text="Cancelling... (may take a moment)")
+            # The transcribe_audio function checks for this flag periodically
+            
+    def transcribe_audio(self, audio_file):
+        """Transcribe the audio file with batch updates."""
         try:
             selected_model = self.model_var.get()
-            device = "cpu"
-            
-            # Use cached model loading
-            model = get_whisper_model(selected_model, device)
             selected_language = self.language_var.get()
+            batch_size = self.batch_size_var.get()
             
-            # if self.gpu_var.get():
-            #     try:
-            #         available_devices = torch_directml.device_count()
-            #         if available_devices > 0:
-            #             device = torch_directml.device(0)
-            #             logging.info(f"Trying DirectML GPU: {device}")
-            #     except Exception as e:
-            #         logging.error(f"Error detecting GPU: {e}")
-            #         device = "cpu"
-            # if device != "cpu":
-            #     try:
-            #         model.to(device)
-            #     except Exception as gpu_error:
-            #         logging.error(f"DirectML error, falling back to CPU: {gpu_error}")
-            #         device = "cpu"
-    
-            # Load token once at start
-            load_dotenv(dotenv_path="token.env")
-            hf_token = os.getenv("HF_TOKEN")
-            if not hf_token:
-                raise ValueError("Hugging Face token not found")
+            start_time = time.time()
             
-            # Create diarization pipeline with optimized settings
-            diarization_pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization",
-                use_auth_token=hf_token,
-                cache_dir="./.cache"  # Cache models locally
-            )
-            # Batch process transcription
-            result = model.transcribe(
-                audio_file,
-                language=selected_language,
-                fp16=False,  # Use FP32 for better CPU performance
-            )
-
-            # Start transcription
-            if "segments" not in result:
-                 raise ValueError("No segments in transcription")
-
-            # Process diarization in batches
-            diarization = diarization_pipeline(audio_file)
+            # Update UI for model loading
+            self.gui_queue.put(lambda: self.progress_label.config(text="Loading model..."))
+            model = get_whisper_model(selected_model, "cpu")
             
-            # Pre-process diarization results
-            diarization_map = {}
-            for turn, _, speaker_label in diarization.itertracks(yield_label=True):
-                diarization_map[(turn.start, turn.end)] = speaker_label
-
-            # Combine results more efficiently
-            combined_segments = self._batch_combine_results(result["segments"], diarization_map)
-            total_segments = len(combined_segments["segments"])
+            # Check if cancelled during model loading
+            if self.cancel_requested:
+                raise InterruptedError("Transcription cancelled by user")
             
-             # Clear existing text before starting new transcription
-            self.gui_queue.put(lambda: self.transcription_text.delete(1.0, tk.END))
+            # Split audio into smaller chunks for better cancel response
+            chunks = self.chunk_audio(audio_file, chunk_duration=15)  # Reduced chunk size
             
-            # Process segments with controlled GUI updates
-            for i, segment in enumerate(combined_segments["segments"], 1):
-                if i % 5 == 0 or i == 1 or i == total_segments:  # Reduce GUI updates
-                    self.gui_queue.put(
-                        lambda s=segment, c=i: self.display_transcription(s, c, total_segments)
+            total_segments = 0
+            processed_segments = 0
+            results = []
+            
+            # Process chunks with cancel checks
+            for chunk in chunks:
+                if self.cancel_requested:
+                    raise InterruptedError("Transcription cancelled by user")
+                    
+                try:
+                    result = model.transcribe(
+                        chunk,
+                        language=selected_language,
+                        fp16=False,
+                        beam_size=1,
+                        best_of=1,
+                        temperature=0.0
                     )
-                    self.update_progress(i, total_segments)
+                    
+                    if "segments" in result:
+                        results.extend(result["segments"])
+                        processed_segments += len(result["segments"])
+                        self.update_progress(processed_segments, total_segments or len(chunks)*10)
+                    
+                    # Display partial results
+                    if result["segments"]:
+                        self.gui_queue.put(lambda segs=result["segments"]: self.display_batch(segs))
+                    
+                except Exception as e:
+                    if self.cancel_requested:
+                        raise InterruptedError("Transcription cancelled by user")
+                    raise e
+                    
+                # Check cancel between chunks
+                if self.cancel_requested:
+                    raise InterruptedError("Transcription cancelled by user")
+                    
+                # Small delay for CPU cooling and cancel responsiveness
+                time.sleep(0.05)
+                
+            # Only show completion if not cancelled
+            if not self.cancel_requested:
+                total_time = time.time() - start_time
+                self.gui_queue.put(lambda t=total_time: self.status_label.config(
+                    text=f"✓ Complete in {t:.1f}s ({processed_segments} segments)"
+                ))
 
+        except InterruptedError:
+            self.gui_queue.put(lambda: self.status_label.config(text="Transcription cancelled"))
+            # Clean up partial results
+            self.gui_queue.put(lambda: self.progress_bar.configure(value=0))
         except Exception as e:
             logging.error(f"Transcription error: {e}")
             self.gui_queue.put(lambda e=e: messagebox.showerror("Error", str(e)))
-            self.gui_queue.put(lambda: self.progress_label.config(text="Error occurred"))
         finally:
-            self.gui_queue.put(lambda: self.toggle_loading_animation(start=False))
+            # Clean up temporary chunk files
+            for chunk in chunks if 'chunks' in locals() else []:
+                try:
+                    if chunk != audio_file and os.path.exists(chunk):
+                        os.remove(chunk)
+                except Exception as e:
+                    logging.error(f"Error cleaning up chunk file: {e}")
             
-    def _batch_combine_results(self, segments, diarization_map):
-        """
-        Efficiently combine transcription and diarization results
-        """
-        combined = []
-        current = None
-        
+            # Reset UI state
+            self.gui_queue.put(self.reset_ui_after_transcription)
+            
+    def reset_ui_after_transcription(self):
+        """Reset UI elements after transcription completes."""
+        self.transcription_running = False
+        self.cancel_requested = False
+        self.transcribe_button.config(state='normal')
+        self.select_button.config(state='normal')
+        self.cancel_button.config(state='disabled')
+        self.progress_bar["value"] = 100 if not self.cancel_requested else 0
+            
+    def display_batch(self, segments):
+        """Display a batch of transcription segments in the text area."""
         for segment in segments:
-            start, end = segment["start"], segment["end"]
             text = segment["text"].strip()
-            speaker = "Unknown"
             
-            # Efficient speaker lookup
-            for (turn_start, turn_end), speaker_label in diarization_map.items():
-                if turn_start <= start and turn_end >= end:
-                    speaker = speaker_label
-                    break
-                    
-            if current and current["speaker"] == speaker:
-                current["end"] = end
-                current["text"] += " " + text
+            # Get current position to add timestamps as needed
+            current_pos = self.transcription_text.index(tk.END)
+            line_num = int(float(current_pos))
+            
+            # Format timestamp for this segment
+            timestamp = f"[{self.format_time(segment['start'])} → {self.format_time(segment['end'])}] "
+            
+            # For first segment or if checkbox is checked, include timestamp
+            if line_num == 1:  # First segment
+                self.transcription_text.insert(tk.END, f"{timestamp}{text}\n")
             else:
-                if current:
-                    combined.append(current)
-                current = {"start": start, "end": end, "text": text, "speaker": speaker}
-                
-        if current:
-            combined.append(current)
+                # Check if we need a space before the new text
+                if not text.startswith((",", ".", "!", "?", ":", ";", ")", "]", "}")):
+                    self.transcription_text.insert(tk.END, f" {text}")
+                else:
+                    self.transcription_text.insert(tk.END, text)
+        
+        # Auto-scroll to see latest text
+        self.transcription_text.see(tk.END)
+        
+    def format_time(self, seconds):
+        """Format seconds as mm:ss"""
+        minutes, seconds = divmod(int(seconds), 60)
+        return f"{minutes:02d}:{seconds:02d}"
             
-        return {"segments": combined}
-    def display_transcription(self, segment, current, total):
-        """
-        Display the transcription segment in the text area with improved formatting.
-        """
-        try:
-            # Validate segment data
-            if not all(key in segment for key in ["text", "speaker"]):
-                raise ValueError("Invalid segment data")
-
-            # Add header separator on first segment
-            if current == 1:
-                self.transcription_text.delete(1.0, tk.END)  # Clear existing text
-                self.transcription_text.insert(tk.END, "_"*80 + "\n")
-
-            # Format and insert the segment text
-            text = segment["text"].strip()
-            speaker = segment["speaker"]
-            formatted_text = f"[{speaker}]: {text}\n"
-            self.transcription_text.insert(tk.END, formatted_text)
-            
-            # Autoscroll and update display
-            self.transcription_text.see(tk.END)
-            self.transcription_text.update_idletasks()
-            
-            # Update progress
-            self.update_progress(current, total)
-            
-            # Show completion message
-            if current == total:
-                self.transcription_text.insert(tk.END, "_"*80 + "\n")
-                self.green_check_label.config(text="✔️ Transcription Complete")
-                messagebox.showinfo("Transcription Complete", 
-                                "The transcription process has completed successfully.")
-                
-        except Exception as e:
-            logging.error(f"Error displaying transcription: {e}")
-            self.green_check_label.config(text="⚠️ Error occurred")
-            messagebox.showerror("Error", f"Failed to display transcription: {str(e)}")
-            
-    def combine_diarization_and_transcription(self, diarization, transcription):
-        """
-        Combine the diarization and transcription results.
-        """
-        combined_segments = []
-        current_segment = None
-        for segment in transcription["segments"]:
-            start = segment["start"]
-            end = segment["end"]
-            text = segment["text"]
-            speaker = "Unknown"
-            for turn, _, speaker_label in diarization.itertracks(yield_label=True):
-                if turn.start <= start and turn.end >= end:
-                    speaker = speaker_label
-                    break
-            if current_segment and current_segment["speaker"] == speaker:
-                current_segment["end"] = end
-                current_segment["text"] += "" +text
-            else:
-                if current_segment:
-                    combined_segments.append(current_segment)
-                current_segment = {"start": start, "end": end, "text": text, "speaker": speaker}
-        if current_segment:
-            combined_segments.append(current_segment)
-        return {"segments": combined_segments}
     def save_transcription(self):
-        """
-        Save the transcription to a text file.
-        """
+        """Save the transcription to a text file with proper Unicode encoding."""
         text = self.transcription_text.get(1.0, tk.END).strip()
         if not text:
             messagebox.showwarning("Warning", "No transcription available to save.")
             return
+            
         try:
-            save_file = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt")])
+            save_file = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text Files", "*.txt")]
+            )
             if save_file:
-                with open(save_file, "w") as file:
+                with open(save_file, "w", encoding="utf-8") as file:
                     file.write(text)
                 messagebox.showinfo("Success", f"Transcription saved to {save_file}")
         except Exception as e:
             logging.error(f"Error saving transcription: {e}")
-            messagebox.showerror("Error", str(e))
-    def refresh_transcription(self):
-        """
-        Refresh the transcription text area and reset the GUI.
-        """
-        if self.current_task and not self.current_task.done():
-            self.current_task.cancel()
+            messagebox.showerror(
+                "Error",
+                "Failed to save file. Make sure you have write permissions and enough disk space."
+            )
             
-        # Clear the GUI queue
-        while not self.gui_queue.empty():
-            try:
-                self.gui_queue.get_nowait()
-            except queue.Empty:
-                break
-                
-        # Reset GUI elements
+    def refresh_transcription(self):
+        """Reset the transcription and UI."""
+        # Cancel if running
+        if self.transcription_running:
+            self.cancel_transcription()
+        
+        # Clear text and reset labels
         self.transcription_text.delete(1.0, tk.END)
-        self.selected_file_label.config(text="No file selected")
-        self.green_check_label.config(text="")
+        self.status_label.config(text="")
         self.progress_label.config(text="")
         self.progress_bar["value"] = 0
-        
-        # Clear file references
-        self.audio_file = None
-        self.converted_audio_file = None
-        
-        # Clear any temporary WAV files
-        self._cleanup_temp_files()
-    
+                
     def _cleanup_temp_files(self):
         """Clean up any temporary WAV files."""
         if self.converted_audio_file and self.converted_audio_file != self.audio_file:
@@ -575,101 +596,163 @@ class ModernWhisperApp:
                     logging.info(f"Cleaned up temporary file: {self.converted_audio_file}")
             except Exception as e:
                 logging.error(f"Error cleaning up temporary file: {e}")
-
-    def select_audio_file(self):
-        """
-        Open a file dialog to select an audio file with proper cleanup.
-        """
-        # Cancel any existing transcription first
-        if self.current_task and not self.current_task.done():
-            self.current_task.cancel()
-            self.executor.shutdown(wait=True)
-            self.executor = ThreadPoolExecutor(max_workers=2)  # Create new executor
-            
-        # Reset all states
-        self._reset_state()
-        
-        # Now proceed with file selection
-        self.audio_file = filedialog.askopenfilename(
-            title="Select Audio File",
-            filetypes=[("Audio Files", "*.mp3 *.wav *.flac *.ogg *.aac *.m4a")]
-        )
-        
-        if self.audio_file:
-            file_name = os.path.basename(self.audio_file)
-            self.selected_file_label.config(text=f"Selected File: {file_name}")
-            
-            supported_formats = (".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a")
-            if not self.audio_file.lower().endswith(supported_formats):
-                messagebox.showerror("Error", "Unsupported audio file format")
-                self._reset_state()
-                return
-                
-            if not self.audio_file.lower().endswith(".wav"):
-                try:
-                    self.converted_audio_file = os.path.splitext(self.audio_file)[0] + "_temp.wav"
-                    audio = AudioSegment.from_file(self.audio_file)
-                    audio.export(self.converted_audio_file, format="wav")
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to convert audio: {str(e)}")
-                    self._reset_state()
-                    return
-            else:
-                self.converted_audio_file = self.audio_file
-    def _reset_state(self):
-        """Reset all application state"""
-        # Clean up files
-        self._cleanup_temp_files()
-        
-        # Reset variables
-        self.audio_file = None
-        self.converted_audio_file = None
-        
-        # Clear GUI elements
-        self.transcription_text.delete(1.0, tk.END)
-        self.selected_file_label.config(text="No file selected")
-        self.green_check_label.config(text="")
-        self.progress_label.config(text="")
-        self.progress_bar["value"] = 0
-        
-        # Clear queue
-        while not self.gui_queue.empty():
-            try:
-                self.gui_queue.get_nowait()
-            except queue.Empty:
-                break
     
-    def cleanup(self):
-        """Clear cached models and temporary files"""
-        import shutil
-        try:
-            shutil.rmtree("./.cache", ignore_errors=True)
-            get_whisper_model.cache_clear()
-        except Exception as e:
-            logging.warning(f"Cleanup error: {e}")
-        
     def on_closing(self):
+        """Clean up resources when closing the application."""
         if messagebox.askokcancel("Quit", "Do you want to quit?"):
-            # Cancel any running transcription
-            if self.current_task and not self.current_task.done():
-                self.current_task.cancel()
+            # Set cancel flag for any running operation
+            self.cancel_requested = True
+            
+            if self.transcription_running:
+                # Give a moment for threads to respond to cancel
+                try:
+                    self.root.after(500)  # Brief pause
+                except:
+                    pass
             
             # Clean up temporary files
             self._cleanup_temp_files()
             
             # Clear cache and shutdown executor
-            self.cleanup()
-            self.executor.shutdown(wait=False)
+            try:
+                get_whisper_model.cache_clear()
+                self.executor.shutdown(wait=False)
+            except:
+                pass
+                
             self.root.destroy()
             
     def process_gui_queue(self):
-        """
-        Process tasks in the GUI queue.
-        """
-        while not self.gui_queue.empty():
-            task = self.gui_queue.get()
-            task()
-        self.root.after(50, self.process_gui_queue)
+        """Process tasks in the GUI queue."""
+        try:
+            # Process up to 10 items at once for smoother operation
+            for _ in range(10):
+                if self.gui_queue.empty():
+                    break
+                task = self.gui_queue.get_nowait()
+                task()
+        except Exception as e:
+            logging.error(f"Error in GUI queue: {e}")
+        finally:
+            # Schedule the next check
+            if not self.cancel_requested:
+                self.root.after(50, self.process_gui_queue)
+
+    # Add this new method to split long audio files
+    def chunk_audio(self, audio_file, chunk_duration=30):
+        """Split long audio files into chunks for faster processing."""
+        try:
+            audio = AudioSegment.from_file(audio_file)
+            chunks = []
+            
+            # Split audio into 30-second chunks
+            for i in range(0, len(audio), chunk_duration * 1000):
+                chunk = audio[i:i + chunk_duration * 1000]
+                chunk_path = f"{audio_file}_chunk_{i//1000}.wav"
+                chunk.export(chunk_path, format="wav")
+                chunks.append(chunk_path)
+            
+            return chunks
+        except Exception as e:
+            logging.error(f"Error chunking audio: {e}")
+            return [audio_file]
+
+    # Add this method for parallel processing
+    def process_chunks(self, chunks, model):
+        """Process audio chunks with CPU management"""
+        chunk_size = max(1, len(chunks) // self.cpu_threads)
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=self.cpu_threads) as executor:
+            futures = []
+            
+            for i in range(0, len(chunks), chunk_size):
+                batch = chunks[i:i + chunk_size]
+                future = executor.submit(
+                    self._process_batch,
+                    batch,
+                    model
+                )
+                futures.append(future)
+            
+            for future in futures:
+                if not self.cancel_requested:
+                    results.extend(future.result())
+        
+        return results
+
+    # Add memory cleanup method
+    def cleanup_memory(self):
+        """Clean up memory after transcription."""
+        import gc
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        gc.collect()
+
+    # Update optimize_audio method
+    def optimize_audio(self, audio_file):
+        """Optimize audio for faster processing"""
+        try:
+            audio = AudioSegment.from_file(audio_file)
+            # Convert to mono
+            audio = audio.set_channels(1)
+            # Lower sample rate
+            audio = audio.set_frame_rate(16000)
+            # Normalize audio
+            audio = audio.normalize()
+            # Remove silence
+            audio = detect_silence(audio, silence_thresh=-40)
+            # Export optimized
+            optimized_path = f"{audio_file}_optimized.wav"
+            audio.export(
+                optimized_path, 
+                format="wav",
+                parameters=["-ac", "1", "-ar", "16000"]
+            )
+            return optimized_path
+        except Exception as e:
+            logging.error(f"Error optimizing audio: {e}")
+            return audio_file
+
+    def update_progress(self, current, total):
+        """Update progress bar and label."""
+        percentage = (current / total) * 100
+        self.gui_queue.put(lambda: self.progress_bar.configure(value=percentage))
+        self.gui_queue.put(lambda: self.progress_label.config(
+            text=f"Processing: {percentage:.0f}% ({current}/{total} segments)"
+        ))
+
+    def _process_batch(self, batch, model):
+        """Process a batch with cooling periods"""
+        results = []
+        for chunk in batch:
+            if self.cancel_requested:
+                break
+                
+            result = model.transcribe(
+                chunk,
+                language=self.language_var.get(),
+                fp16=False,
+                beam_size=1,
+                best_of=1,
+                temperature=0.0
+            )
+            results.append(result)
+            
+            # Add small delay to prevent CPU overheating
+            time.sleep(0.1)
+        
+        return results
+
+    def optimize_processing(self):
+        """Configure optimal processing settings"""
+        # Set environment variables for better performance
+        os.environ['OMP_NUM_THREADS'] = str(self.cpu_threads)
+        os.environ['MKL_NUM_THREADS'] = str(self.cpu_threads)
+        
+        # Configure torch for faster processing
+        torch.set_grad_enabled(False)  # Disable gradients
+        if torch.backends.mkldnn.is_available():
+            torch.backends.mkldnn.enabled = True
 
 if __name__ == "__main__":
     root = tk.Tk()
